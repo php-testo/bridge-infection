@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Testo\Bridge\Infection;
 
 use Infection\AbstractTestFramework\TestFrameworkAdapter;
+use Infection\StreamWrapper\IncludeInterceptor;
 
 /**
  * Bridges Infection mutation testing with Testo.
@@ -153,7 +154,7 @@ final class TestoAdapter implements TestFrameworkAdapter
         }
         foreach (\array_keys($paths) as $path) {
             $cmd[] = '--path';
-            $cmd[] = $path;
+            $cmd[] = $this->relativizeToProjectDir($path);
         }
         foreach (\array_keys($methods) as $method) {
             $cmd[] = '--filter';
@@ -202,6 +203,26 @@ final class TestoAdapter implements TestFrameworkAdapter
     }
 
     /**
+     * Make a path relative to the project directory when possible, to keep the
+     * mutant command line short. Windows caps `CreateProcess` arguments at ~32 KB,
+     * so emitting absolute paths for every `--path` flag (one per covering test
+     * file) can exceed the limit on large projects with `proc_open(): CreateProcess
+     * failed, error code: 206`.
+     *
+     * Testo runs with cwd = project dir (inherited from Infection), so relative
+     * paths resolve correctly.
+     */
+    private function relativizeToProjectDir(string $path): string
+    {
+        $base = \rtrim(\str_replace('\\', '/', $this->projectDir), '/');
+        $normalized = \str_replace('\\', '/', $path);
+
+        return \str_starts_with($normalized, $base . '/')
+            ? \substr($normalized, \strlen($base) + 1)
+            : $path;
+    }
+
+    /**
      * Writes a per-mutant auto_prepend_file with the original/mutant paths baked in.
      *
      * Avoids relying on env-variable inheritance, which Symfony Process does not reliably
@@ -214,18 +235,25 @@ final class TestoAdapter implements TestFrameworkAdapter
         \is_dir($this->tmpDir) or \mkdir($this->tmpDir, 0o755, true);
 
         $autoload = $this->projectDir . '/vendor/autoload.php';
+        $interceptor = IncludeInterceptor::LOCATION;
 
+        # Load the interceptor and enable it BEFORE requiring Composer's autoload, so that
+        # `files`-autoloaded sources (e.g. `plugin/*/Repeat.php`, `Retry.php`) go through
+        # the stream wrapper. Otherwise they'd be loaded with original content before the
+        # interceptor is active, and mutations on those files would silently survive.
         $contents = \sprintf(
             <<<'PHP'
                 <?php
                 declare(strict_types=1);
-                require %s;
+                require_once %s;
                 \Infection\StreamWrapper\IncludeInterceptor::intercept(%s, %s);
                 \Infection\StreamWrapper\IncludeInterceptor::enable();
+                require %s;
                 PHP,
-            \var_export($autoload, true),
+            \var_export($interceptor, true),
             \var_export($original, true),
             \var_export($mutant, true),
+            \var_export($autoload, true),
         );
 
         $path = $this->tmpDir . '/testo-bootstrap-' . $hash . '.php';
